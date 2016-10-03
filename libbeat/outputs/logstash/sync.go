@@ -19,6 +19,7 @@ type client struct {
 	*transport.Client
 	client *v2.SyncClient
 	win    window
+	ttl    ttl
 }
 
 func newLumberjackClient(
@@ -26,11 +27,15 @@ func newLumberjackClient(
 	compressLevel int,
 	maxWindowSize int,
 	timeout time.Duration,
+	ttlDuration time.Duration,
 	beat string,
 ) (*client, error) {
 	c := &client{}
 	c.Client = conn
 	c.win.init(defaultStartMaxWindowSize, maxWindowSize)
+
+	c.ttl = ttl{duration: ttlDuration}
+	c.ttl.init()
 
 	enc, err := makeLogstashEventEncoder(beat)
 	if err != nil {
@@ -97,6 +102,11 @@ func (l *client) PublishEvents(
 // returning the total number of events sent (due to window size, or acks until
 // failure).
 func (c *client) publishWindowed(data []outputs.Data) (int, error) {
+	err := c.checkTTL()
+	if err != nil {
+		return 0, err
+	}
+
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -130,4 +140,24 @@ func (c *client) sendEvents(data []outputs.Data) (int, error) {
 		window[i] = d
 	}
 	return c.client.Send(window)
+}
+
+func (c *client) checkTTL() error {
+	if c.ttl.expired {
+		err := c.Close()
+		if err != nil {
+			return err
+		}
+		err = c.Connect(0)
+		if err != nil {
+			return err
+		}
+
+		c.ttl.expired = false
+		go func(cl *client) {
+			<-time.NewTimer(c.ttl.duration).C
+			cl.ttl.expired = true
+		}(c)
+	}
+	return nil
 }

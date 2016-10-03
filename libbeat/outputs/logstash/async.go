@@ -15,6 +15,7 @@ type asyncClient struct {
 	*transport.Client
 	client *v2.AsyncClient
 	win    window
+	ttl    ttl
 
 	connect func() error
 }
@@ -34,11 +35,15 @@ func newAsyncLumberjackClient(
 	compressLevel int,
 	maxWindowSize int,
 	timeout time.Duration,
+	ttlDuration time.Duration,
 	beat string,
 ) (*asyncClient, error) {
 	c := &asyncClient{}
 	c.Client = conn
 	c.win.init(defaultStartMaxWindowSize, maxWindowSize)
+
+	c.ttl = ttl{duration: ttlDuration}
+	c.ttl.init()
 
 	enc, err := makeLogstashEventEncoder(beat)
 	if err != nil {
@@ -128,6 +133,11 @@ func (c *asyncClient) publishWindowed(
 	ref *msgRef,
 	data []outputs.Data,
 ) (int, error) {
+	err := c.checkTTL()
+	if err != nil {
+		return 0, err
+	}
+
 	batchSize := len(data)
 	windowSize := c.win.get()
 	debug("Try to publish %v events to logstash with window size %v",
@@ -138,7 +148,7 @@ func (c *asyncClient) publishWindowed(
 		data = data[:windowSize]
 	}
 
-	err := c.sendEvents(ref, data)
+	err = c.sendEvents(ref, data)
 	if err != nil {
 		return 0, err
 	}
@@ -153,6 +163,26 @@ func (c *asyncClient) sendEvents(ref *msgRef, data []outputs.Data) error {
 	}
 	atomic.AddInt32(&ref.count, 1)
 	return c.client.Send(ref.callback, window)
+}
+
+func (c *asyncClient) checkTTL() error {
+	if c.ttl.expired {
+		err := c.Close()
+		if err != nil {
+			return err
+		}
+		err = c.Connect(0)
+		if err != nil {
+			return err
+		}
+
+		c.ttl.expired = false
+		go func() {
+			<-time.NewTimer(c.ttl.duration).C
+			c.ttl.expired = true
+		}()
+	}
+	return nil
 }
 
 func (r *msgRef) callback(seq uint32, err error) {
